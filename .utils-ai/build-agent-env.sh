@@ -1,21 +1,41 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+#
+# Requires bash: the step registry uses associative arrays. When piped from
+# curl there is no file to re-exec, so fail loudly rather than let a later
+# array literal produce a confusing syntax error.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "error: this installer requires bash, not sh." >&2
+  echo "  curl -fsSL <url> | bash" >&2
+  echo "  bash build-agent-env.sh" >&2
+  exit 1
+fi
+set -euo pipefail
 
 # Bootstrap a complete agentic development environment on Linux.
 #
 # Intended use:
-#   curl -fsSL https://raw.githubusercontent.com/grahamlopez/dots/main/.utils/build_agent_env.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/grahamlopez/dots/main/.utils/build_agent_env.sh | sh -s -- --yes
+#   curl -fsSL https://raw.githubusercontent.com/grahamlopez/dots-ai/main/.utils-ai/build-agent-env.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/grahamlopez/dots-ai/main/.utils-ai/build-agent-env.sh | bash -s -- --yes
+#
+# The first form opens the wizard: piping the script into bash makes stdin the
+# script itself, so every prompt reads and writes /dev/tty instead. The second
+# form takes everything without asking.
 #
 # Useful overrides:
 #   DOTFILES_REPO=git@github.com:grahamlopez/dots \
 #   AI_DOTFILES_REPO=git@github.com:grahamlopez/dots-ai \
 #   INSTALL_ROOT="$HOME/local" \
 #   GO_VERSION=go1.26.4 \
-#   sh build_agent_env.sh
+#   bash build-agent-env.sh
 #
-# Every install step can be turned off individually with its own --skip-* flag,
-# and a step that fails is reported at the end instead of aborting the run.
+# With no arguments and a terminal attached, an interactive wizard asks what to
+# install, showing what is already present. Passing any step selection flag, or
+# --yes, runs non-interactively; without a terminal it installs everything, as
+# it always has. A step that fails is reported at the end rather than aborting
+# the run.
+#
+# Steps are described once in the step registry below; main, --help, the flag
+# parser, the prerequisite check, and the wizard are all generated from it.
 #
 # Any Linux distribution works. Prerequisites are checked, never installed, and
 # are split into what this installer and the tools it installs need, versus
@@ -50,44 +70,127 @@ BREV_INSTALL_URL=${BREV_INSTALL_URL:-https://raw.githubusercontent.com/brevdev/b
 
 ASSUME_YES=0
 SKIP_PREREQS=0
-SKIP_CORE_DOTFILES=0
-SKIP_AI_DOTFILES=0
-SKIP_TMUX=0
-SKIP_NVIM=0
-SKIP_GO=0
-SKIP_NODE=0
-SKIP_NPM_TOOLS=0
-SKIP_CLAUDE=0
-SKIP_CODEX=0
-SKIP_CURSOR=0
-SKIP_PI=0
-SKIP_BREV=0
+RUN_WIZARD=auto
+SELECTION_EXPLICIT=0
+LIST_STEPS_ONLY=0
+PENDING_ONLY=
+PENDING_SKIP=
+
+# The step registry. Everything that installs something is described here once;
+# main, usage, the flag parser, the prerequisite check, and the wizard are all
+# driven from it, so adding a step means adding one row rather than touching
+# five places.
+STEP_ORDER=(
+  core-dotfiles
+  ai-dotfiles
+  tmux
+  nvim
+  go
+  node
+  npm-tools
+  claude
+  codex
+  cursor
+  pi
+  brev
+)
+
+declare -A STEP_LABEL=(
+  [core-dotfiles]="Core dotfiles"
+  [ai-dotfiles]="AI dotfiles"
+  [tmux]="tmux (built from source)"
+  [nvim]="Neovim"
+  [go]="Go toolchain"
+  [node]="nvm, Node.js, and npm"
+  [npm-tools]="Global npm dev tools"
+  [claude]="Claude CLI"
+  [codex]="Codex CLI"
+  [cursor]="Cursor agent CLI"
+  [pi]="pi.dev CLI"
+  [brev]="NVIDIA Brev CLI"
+)
+
+declare -A STEP_FN=(
+  [core-dotfiles]=install_core_dotfiles
+  [ai-dotfiles]=install_ai_dotfiles
+  [tmux]=install_tmux
+  [nvim]=install_nvim
+  [go]=install_go
+  [node]=install_nvm_node
+  [npm-tools]=install_global_npm_tools
+  [claude]=install_claude
+  [codex]=install_codex
+  [cursor]=install_cursor
+  [pi]=install_pi
+  [brev]=install_brev
+)
+
+# Steps that cannot run without another step's result.
+declare -A STEP_NEEDS=(
+  [npm-tools]="node"
+)
+
+# Command that proves a step is already installed, and how to ask its version.
+declare -A STEP_PROBE=(
+  [tmux]="tmux -V"
+  [nvim]="nvim --version"
+  [go]="go version"
+  [node]="node --version"
+  [npm-tools]="tsc --version"
+  [claude]="claude --version"
+  [codex]="codex --version"
+  [cursor]="cursor-agent --version"
+  [pi]="pi --version"
+  [brev]="brev --version"
+)
+
+# Detected state of each step, filled in by detect_step_status.
+declare -A STEP_STATUS=()
+
+# Selection state: 1 = install, 0 = skip. Everything is on by default.
+declare -A STEP_ON=()
+for _step in "${STEP_ORDER[@]}"; do STEP_ON[$_step]=1; done
+unset _step
+
+step_exists() {
+  [[ -n "${STEP_LABEL[$1]:-}" ]]
+}
+
+step_on() {
+  [[ "${STEP_ON[$1]}" = 1 ]]
+}
+
+set_step() {
+  STEP_ON[$1]=$2
+}
+
+# Mark that the command line chose steps, which suppresses the wizard.
+set_step_explicit() {
+  set_step "$1" "$2"
+  SELECTION_EXPLICIT=1
+}
 
 # Steps that failed without stopping the run. Reported by print_completion_notes.
 FAILED_STEPS=
 
 usage() {
   cat <<'USAGE'
-Usage: build_agent_env.sh [options]
+Usage: build-agent-env.sh [options]
+
+With no options and a terminal attached, an interactive wizard asks what to
+install. Passing any step selection flag, or --yes, runs non-interactively.
 
 Options:
-  -y, --yes             Run non-interactively where possible.
+  -y, --yes             Install everything without asking.
+  --wizard              Force the wizard on, seeded with any flags given.
+  --no-wizard           Never ask; use the defaults and flags as given.
+  --only a,b,c          Install only these steps.
+  --skip a,b,c          Install everything except these steps.
+  --skip-<step>         Skip one step; see --list for the names.
+  --skip-dotfiles       Skip both dotfiles steps.
+  --skip-ai-tools       Skip claude, codex, cursor, and pi (not brev).
   --skip-prereqs        Do not check for prerequisite commands.
-  --skip-dotfiles       Do not install either dotfiles repo (core and AI).
-  --skip-core-dotfiles  Do not clone or check out the core dotfiles repo.
-  --skip-ai-dotfiles    Do not clone or check out the AI dotfiles repo.
-  --skip-tmux           Do not build tmux from GitHub releases.
-  --skip-nvim           Do not install Neovim from GitHub releases.
-  --skip-go             Do not install Go from official binary releases.
-  --skip-node           Do not install nvm, Node.js, or npm.
-  --skip-npm-tools      Do not install the global npm development tools.
-  --skip-ai-tools       Do not install the four agent CLIs (claude, codex,
-                        cursor, pi). Brev is separate; use --skip-brev.
-  --skip-claude         Do not install the Claude CLI.
-  --skip-codex          Do not install the Codex CLI.
-  --skip-cursor         Do not install the Cursor agent CLI.
-  --skip-pi             Do not install the pi.dev CLI.
-  --skip-brev           Do not install the NVIDIA Brev CLI.
+  --list                List the step names and exit.
   -h, --help            Show this help.
 
 Environment overrides:
@@ -110,59 +213,99 @@ Environment overrides:
 USAGE
 }
 
+list_steps() {
+  printf 'Steps, in the order they run:\n\n'
+  local step
+  for step in "${STEP_ORDER[@]}"; do
+    printf '  %-14s %s\n' "$step" "${STEP_LABEL[$step]}"
+  done
+}
+
+# Validate a comma or space separated step list. Returns non-zero rather than
+# calling exit, so the caller can exit from the current shell -- an exit inside
+# a command or process substitution would only end the subshell and let the run
+# continue with an empty selection.
+validate_step_list() {
+  local list=$1 step
+  for step in ${list//,/ }; do
+    if ! step_exists "$step"; then
+      echo "error: unknown step: $step" >&2
+      echo "Run --list to see the step names." >&2
+      return 2
+    fi
+  done
+  return 0
+}
+
+# Turn the flags the parser collected into selection state. Runs after the
+# function definitions, which is why the parser only records them.
+apply_pending_selection() {
+  local step
+
+  validate_step_list "$PENDING_ONLY" || exit 2
+  validate_step_list "$PENDING_SKIP" || exit 2
+
+  if [ -n "$PENDING_ONLY" ]; then
+    for step in "${STEP_ORDER[@]}"; do
+      set_step "$step" 0
+    done
+    for step in ${PENDING_ONLY//,/ }; do
+      set_step "$step" 1
+    done
+    SELECTION_EXPLICIT=1
+  fi
+
+  if [ -n "$PENDING_SKIP" ]; then
+    for step in ${PENDING_SKIP//,/ }; do
+      set_step "$step" 0
+    done
+    SELECTION_EXPLICIT=1
+  fi
+}
+
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -y|--yes)
       ASSUME_YES=1
+      RUN_WIZARD=off
+      ;;
+    --wizard)
+      RUN_WIZARD=on
+      ;;
+    --no-wizard)
+      RUN_WIZARD=off
+      ;;
+    --list)
+      LIST_STEPS_ONLY=1
+      ;;
+    --only)
+      [ "$#" -ge 2 ] || { echo "--only needs a list" >&2; exit 2; }
+      PENDING_ONLY=$2
+      shift
+      ;;
+    --only=*)
+      PENDING_ONLY=${1#*=}
+      ;;
+    --skip)
+      [ "$#" -ge 2 ] || { echo "--skip needs a list" >&2; exit 2; }
+      PENDING_SKIP="${PENDING_SKIP:-},$2"
+      shift
+      ;;
+    --skip=*)
+      PENDING_SKIP="${PENDING_SKIP:-},${1#*=}"
       ;;
     --skip-prereqs)
       SKIP_PREREQS=1
       ;;
     --skip-dotfiles)
-      SKIP_CORE_DOTFILES=1
-      SKIP_AI_DOTFILES=1
-      ;;
-    --skip-core-dotfiles)
-      SKIP_CORE_DOTFILES=1
-      ;;
-    --skip-ai-dotfiles)
-      SKIP_AI_DOTFILES=1
-      ;;
-    --skip-tmux)
-      SKIP_TMUX=1
-      ;;
-    --skip-nvim)
-      SKIP_NVIM=1
-      ;;
-    --skip-go)
-      SKIP_GO=1
-      ;;
-    --skip-node)
-      SKIP_NODE=1
-      ;;
-    --skip-npm-tools)
-      SKIP_NPM_TOOLS=1
+      PENDING_SKIP="${PENDING_SKIP:-},core-dotfiles,ai-dotfiles"
       ;;
     --skip-ai-tools)
-      SKIP_CLAUDE=1
-      SKIP_CODEX=1
-      SKIP_CURSOR=1
-      SKIP_PI=1
+      PENDING_SKIP="${PENDING_SKIP:-},claude,codex,cursor,pi"
       ;;
-    --skip-claude)
-      SKIP_CLAUDE=1
-      ;;
-    --skip-codex)
-      SKIP_CODEX=1
-      ;;
-    --skip-cursor)
-      SKIP_CURSOR=1
-      ;;
-    --skip-pi)
-      SKIP_PI=1
-      ;;
-    --skip-brev)
-      SKIP_BREV=1
+    --skip-*)
+      PENDING_SKIP="${PENDING_SKIP:-},${1#--skip-}"
       ;;
     -h|--help)
       usage
@@ -227,7 +370,7 @@ prompt_yes_no() {
     return 0
   fi
 
-  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+  if ! tty_available; then
     die "cannot prompt without a TTY; rerun with --yes after confirming the prerequisite manually"
   fi
 
@@ -417,11 +560,11 @@ EOF2
 
 # True when a step that clones over GitHub SSH is enabled.
 uses_github_ssh() {
-  if [ "$SKIP_CORE_DOTFILES" = 0 ] && repo_uses_github_ssh "$DOTFILES_REPO"; then
+  if step_on core-dotfiles && repo_uses_github_ssh "$DOTFILES_REPO"; then
     return 0
   fi
 
-  if [ "$SKIP_AI_DOTFILES" = 0 ] && repo_uses_github_ssh "$AI_DOTFILES_REPO"; then
+  if step_on ai-dotfiles && repo_uses_github_ssh "$AI_DOTFILES_REPO"; then
     return 0
   fi
 
@@ -434,16 +577,25 @@ uses_github_ssh() {
 required_commands() {
   printf '%s\n' git curl tar sed awk
 
-  [ "$SKIP_GO" = 1 ] || printf '%s\n' jq sha256sum
-  [ "$SKIP_TMUX" = 1 ] || printf '%s\n' cc make pkg-config
-  [ "$SKIP_PI" = 1 ] || printf '%s\n' setsid
+  if step_on go; then
+    printf '%s\n' jq sha256sum
+  fi
+
+  if step_on tmux; then
+    printf '%s\n' cc make pkg-config
+  fi
+
+  if step_on pi; then
+    printf '%s\n' setsid
+  fi
 
   # The Brev installer stages the download in a mktemp directory.
-  [ "$SKIP_BREV" = 1 ] || printf '%s\n' mktemp
+  if step_on brev; then
+    printf '%s\n' mktemp
+  fi
 
   # nvm and the Claude, Cursor, and Brev installers are bash scripts.
-  if [ "$SKIP_NODE" = 0 ] || [ "$SKIP_CLAUDE" = 0 ] || [ "$SKIP_CURSOR" = 0 ] ||
-     [ "$SKIP_BREV" = 0 ]; then
+  if step_on node || step_on claude || step_on cursor || step_on brev; then
     printf '%s\n' bash
   fi
 
@@ -594,11 +746,11 @@ EOF2
     fi
   fi
 
-  if [ "$SKIP_CORE_DOTFILES" = 0 ] && ! git ls-remote "$DOTFILES_REPO" HEAD >/dev/null 2>&1; then
+  if step_on core-dotfiles && ! git ls-remote "$DOTFILES_REPO" HEAD >/dev/null 2>&1; then
     die "cannot access $DOTFILES_REPO"
   fi
 
-  if [ "$SKIP_AI_DOTFILES" = 0 ] && ! git ls-remote "$AI_DOTFILES_REPO" HEAD >/dev/null 2>&1; then
+  if step_on ai-dotfiles && ! git ls-remote "$AI_DOTFILES_REPO" HEAD >/dev/null 2>&1; then
     die "cannot access $AI_DOTFILES_REPO (rerun with --skip-ai-dotfiles if it does not exist yet)"
   fi
 }
@@ -667,15 +819,11 @@ install_bare_dotfiles() {
 }
 
 install_core_dotfiles() {
-  [ "$SKIP_CORE_DOTFILES" = 0 ] || return 0
-
   log "Installing core dotfiles"
   install_bare_dotfiles core "$DOTFILES_REPO" "$DOTFILES_DIR"
 }
 
 install_ai_dotfiles() {
-  [ "$SKIP_AI_DOTFILES" = 0 ] || return 0
-
   log "Installing AI dotfiles"
   install_bare_dotfiles ai "$AI_DOTFILES_REPO" "$AI_DOTFILES_DIR"
 }
@@ -712,8 +860,6 @@ cpu_count() {
 }
 
 install_tmux() {
-  [ "$SKIP_TMUX" = 0 ] || return 0
-
   log "Building latest tmux release"
   tag=$(latest_github_tag tmux/tmux)
   version=${tag#tmux-}
@@ -756,8 +902,6 @@ machine_arch() {
 }
 
 install_nvim() {
-  [ "$SKIP_NVIM" = 0 ] || return 0
-
   log "Installing latest Neovim release"
   tag=$(latest_github_tag neovim/neovim)
   version=${tag#v}
@@ -819,8 +963,6 @@ normalize_go_version() {
 }
 
 install_go() {
-  [ "$SKIP_GO" = 0 ] || return 0
-
   log "Installing Go from official binary releases"
   version=$(normalize_go_version "$GO_VERSION")
   case "$version" in
@@ -871,8 +1013,6 @@ install_go() {
 }
 
 install_nvm_node() {
-  [ "$SKIP_NODE" = 0 ] || return 0
-
   log "Installing nvm, Node.js, and npm"
   export NVM_DIR="$HOME/.nvm"
 
@@ -907,8 +1047,6 @@ use_default_node() {
 }
 
 install_global_npm_tools() {
-  [ "$SKIP_NPM_TOOLS" = 0 ] || return 0
-
   log "Installing global npm development tools"
   use_default_node
   have npm || die "npm is not available; rerun without --skip-node"
@@ -922,8 +1060,6 @@ install_global_npm_tools() {
 }
 
 install_claude() {
-  [ "$SKIP_CLAUDE" = 0 ] || return 0
-
   log "Installing the Claude CLI"
   use_default_node
 
@@ -935,8 +1071,6 @@ install_claude() {
 }
 
 install_codex() {
-  [ "$SKIP_CODEX" = 0 ] || return 0
-
   log "Installing the Codex CLI"
   use_default_node
 
@@ -948,8 +1082,6 @@ install_codex() {
 }
 
 install_cursor() {
-  [ "$SKIP_CURSOR" = 0 ] || return 0
-
   log "Installing the Cursor agent CLI"
   use_default_node
 
@@ -965,8 +1097,6 @@ install_cursor() {
 }
 
 install_pi() {
-  [ "$SKIP_PI" = 0 ] || return 0
-
   log "Installing the pi.dev CLI"
   use_default_node
 
@@ -985,8 +1115,6 @@ install_pi() {
 # available. It installs to $HOME/.local/bin and never needs sudo -- running it
 # with sudo would resolve $HOME to root's home instead.
 install_brev() {
-  [ "$SKIP_BREV" = 0 ] || return 0
-
   log "Installing the NVIDIA Brev CLI"
 
   download_file "$BREV_INSTALL_URL" "$SCRATCH_DIR/brev-install.sh"
@@ -1025,31 +1153,342 @@ If this was the first nvm install in the shell, open a new terminal or run:
 EOF2
 }
 
+# --- installed-state detection --------------------------------------------
+
+# node and the global npm tools live under nvm, which is not on PATH until it is
+# sourced, so look for the binary directly rather than using command -v.
+nvm_bin() {
+  local match
+  for match in "$HOME"/.nvm/versions/node/*/bin/"$1"; do
+    if [ -x "$match" ]; then
+      printf '%s' "$match"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Run a version probe defensively: a third-party CLI can be slow or hang, and
+# this runs before anything is installed.
+probe_version() {
+  local out=
+  if have timeout; then
+    out=$(timeout 3 $1 2>/dev/null | head -n1) || out=
+  else
+    out=$($1 2>/dev/null | head -n1) || out=
+  fi
+  # "go version go1.26.6 linux/amd64" is mostly noise in a status column.
+  out=${out#go version }
+  printf '%s' "${out:0:34}"
+}
+
+# A short description of what is already present for one step. Always succeeds;
+# "-" means nothing found.
+step_status() {
+  local step=$1 probe cmd bin out
+
+  case "$step" in
+    core-dotfiles)
+      if [ -d "$DOTFILES_DIR" ]; then printf 'cloned'; else printf -- '-'; fi
+      return 0
+      ;;
+    ai-dotfiles)
+      if [ -d "$AI_DOTFILES_DIR" ]; then printf 'cloned'; else printf -- '-'; fi
+      return 0
+      ;;
+    node)
+      if bin=$(nvm_bin node); then
+        out=$(probe_version "$bin --version")
+        if [ -n "$out" ]; then printf '%s' "$out"; else printf 'installed'; fi
+      elif [ -s "$HOME/.nvm/nvm.sh" ]; then
+        printf 'nvm only'
+      else
+        printf -- '-'
+      fi
+      return 0
+      ;;
+    npm-tools)
+      if nvm_bin tsc >/dev/null; then printf 'installed'; else printf -- '-'; fi
+      return 0
+      ;;
+  esac
+
+  probe=${STEP_PROBE[$step]:-}
+  if [ -z "$probe" ]; then
+    printf -- '-'
+    return 0
+  fi
+
+  cmd=${probe%% *}
+  if ! have "$cmd"; then
+    printf -- '-'
+    return 0
+  fi
+
+  out=$(probe_version "$probe")
+  if [ -n "$out" ]; then printf '%s' "$out"; else printf 'installed'; fi
+  return 0
+}
+
+step_missing() {
+  [ "${STEP_STATUS[$1]:--}" = "-" ]
+}
+
+detect_step_status() {
+  local step
+  for step in "${STEP_ORDER[@]}"; do
+    STEP_STATUS[$step]=$(step_status "$step")
+  done
+}
+
+# --- wizard ----------------------------------------------------------------
+
+# Test by opening /dev/tty, not with -r/-w: the permission test can pass on a
+# /dev/tty that cannot actually be opened.
+tty_available() {
+  { : >/dev/tty; } 2>/dev/null
+}
+
+tty_say() {
+  printf '%s\n' "$*" > /dev/tty
+}
+
+tty_ask() {
+  printf '%s' "$1" > /dev/tty
+}
+
+wizard_should_run() {
+  case "$RUN_WIZARD" in
+    on)
+      tty_available && return 0
+      warn "--wizard was given but no terminal is available"
+      return 1
+      ;;
+    off)
+      return 1
+      ;;
+  esac
+
+  [ "$SELECTION_EXPLICIT" = 0 ] || return 1
+  tty_available
+}
+
+select_all() {
+  local step
+  for step in "${STEP_ORDER[@]}"; do
+    set_step "$step" "$1"
+  done
+}
+
+select_only() {
+  local step
+  select_all 0
+  for step in "$@"; do
+    set_step "$step" 1
+  done
+}
+
+select_missing() {
+  local step
+  for step in "${STEP_ORDER[@]}"; do
+    if step_missing "$step"; then set_step "$step" 1; else set_step "$step" 0; fi
+  done
+}
+
+wizard_render() {
+  local step i=0 mark
+
+  tty_say ""
+  printf '   %2s  %-3s %-26s %s\n' "#" "" "step" "already installed" > /dev/tty
+  tty_say "  ----------------------------------------------------------------"
+  for step in "${STEP_ORDER[@]}"; do
+    i=$((i + 1))
+    if step_on "$step"; then mark="x"; else mark=" "; fi
+    printf '   %2d  [%s] %-26s %s\n' \
+      "$i" "$mark" "${STEP_LABEL[$step]}" "${STEP_STATUS[$step]:--}" > /dev/tty
+  done
+}
+
+wizard_toggle_index() {
+  local i=$1 step
+  if [ "$i" -lt 1 ] || [ "$i" -gt "${#STEP_ORDER[@]}" ]; then
+    tty_say "  no such number: $i"
+    return 0
+  fi
+  step=${STEP_ORDER[$((i - 1))]}
+  if step_on "$step"; then set_step "$step" 0; else set_step "$step" 1; fi
+}
+
+wizard_toggle_tokens() {
+  local tok lo hi i
+  for tok in ${1//,/ }; do
+    case "$tok" in
+      [0-9]*-[0-9]*)
+        lo=${tok%%-*}
+        hi=${tok##*-}
+        for ((i = lo; i <= hi; i++)); do
+          wizard_toggle_index "$i"
+        done
+        ;;
+      [0-9]*)
+        wizard_toggle_index "$tok"
+        ;;
+      *)
+        tty_say "  did not understand: $tok"
+        ;;
+    esac
+  done
+}
+
+wizard_custom() {
+  local input
+
+  while true; do
+    wizard_render
+    tty_say ""
+    tty_say "  numbers toggle a line (3, or 3 5, or 3-6)"
+    tty_say "  a all   n none   m only what is missing   d done   q quit"
+    tty_ask "  > "
+    IFS= read -r input < /dev/tty || input=d
+
+    case "$input" in
+      d|"") return 0 ;;
+      q) die "cancelled" ;;
+      a) select_all 1 ;;
+      n) select_all 0 ;;
+      m) select_missing ;;
+      *) wizard_toggle_tokens "$input" ;;
+    esac
+  done
+}
+
+wizard_presets() {
+  local choice
+
+  tty_say ""
+  tty_say "  1) Everything"
+  tty_say "  2) Only what is missing"
+  tty_say "  3) Dotfiles, tmux, and Neovim"
+  tty_say "  4) Agent CLIs only"
+  tty_say "  5) Choose individually"
+  tty_ask "  Choose [1]: "
+  IFS= read -r choice < /dev/tty || choice=1
+
+  case "${choice:-1}" in
+    1) select_all 1 ;;
+    2) select_missing ;;
+    3) select_only core-dotfiles ai-dotfiles tmux nvim ;;
+    4) select_only claude codex cursor pi brev ;;
+    5) wizard_custom ;;
+    *)
+      tty_say "  not one of the choices; taking everything"
+      select_all 1
+      ;;
+  esac
+}
+
+wizard_confirm() {
+  local answer chosen
+
+  resolve_step_deps
+  chosen=$(selected_steps | tr '\n' ' ')
+
+  tty_say ""
+  if [ -z "${chosen// /}" ]; then
+    tty_say "  Nothing selected."
+  else
+    tty_say "  Will install:$chosen"
+  fi
+  tty_ask "  Proceed? [Y/n] "
+  IFS= read -r answer < /dev/tty || answer=y
+
+  case "$answer" in
+    n|N|no|NO|No) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+run_wizard() {
+  log "What should be installed?"
+  tty_say "  checking what is already present..."
+  detect_step_status
+
+  while true; do
+    wizard_presets
+    if wizard_confirm; then
+      return 0
+    fi
+    wizard_custom
+    if wizard_confirm; then
+      return 0
+    fi
+  done
+}
+
+# Turn on anything a selected step depends on. Loops until stable so a chain of
+# dependencies resolves.
+resolve_step_deps() {
+  local step need changed=1
+
+  while [ "$changed" = 1 ]; do
+    changed=0
+    for step in "${STEP_ORDER[@]}"; do
+      step_on "$step" || continue
+      for need in ${STEP_NEEDS[$step]:-}; do
+        if ! step_on "$need"; then
+          set_step "$need" 1
+          warn "enabling '$need', which '$step' needs"
+          changed=1
+        fi
+      done
+    done
+  done
+}
+
+selected_steps() {
+  local step
+  for step in "${STEP_ORDER[@]}"; do
+    step_on "$step" && printf '%s\n' "$step"
+  done
+  return 0
+}
+
 main() {
+  apply_pending_selection
+
+  if [ "$LIST_STEPS_ONLY" = 1 ]; then
+    list_steps
+    exit 0
+  fi
+
   # Preflight stays fatal: a non-Linux host, missing prerequisites, or an
   # unusable SSH key makes every step below meaningless.
   require_linux
   ensure_dirs
+
+  if wizard_should_run; then
+    run_wizard
+  elif [ "$SELECTION_EXPLICIT" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ "$RUN_WIZARD" != off ]; then
+    warn "no terminal available; installing everything (use --only/--skip, or --yes to silence this)"
+  fi
+
+  resolve_step_deps
   check_prerequisites
 
-  if [ "$SKIP_CORE_DOTFILES" = 0 ] || [ "$SKIP_AI_DOTFILES" = 0 ]; then
+  if step_on core-dotfiles || step_on ai-dotfiles; then
     require_github_repo_access
   fi
 
-  # Core runs before AI, so the AI repo wins any path both repos track.
-  run_step core-dotfiles install_core_dotfiles
-  run_step ai-dotfiles install_ai_dotfiles
-  run_step tmux install_tmux
-  run_step nvim install_nvim
-  run_step go install_go
-  run_step node install_nvm_node
+  # Core dotfiles run before AI dotfiles, so the AI repo wins any path both
+  # repos track.
+  local step
+  for step in "${STEP_ORDER[@]}"; do
+    if step_on "$step"; then
+      run_step "$step" "${STEP_FN[$step]}"
+    fi
+  done
+
   ensure_profile_snippet
-  run_step npm-tools install_global_npm_tools
-  run_step claude install_claude
-  run_step codex install_codex
-  run_step cursor install_cursor
-  run_step pi install_pi
-  run_step brev install_brev
   print_completion_notes
 
   [ -z "$FAILED_STEPS" ] || exit 1

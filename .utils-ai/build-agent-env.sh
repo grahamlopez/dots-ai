@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Overview and bash guard {{{
 #
 # Requires bash: the step registry uses associative arrays. When piped from
 # curl there is no file to re-exec, so fail loudly rather than let a later
@@ -49,6 +50,9 @@ set -euo pipefail
 # disjoint -- if both track the same file, each repo will report the other
 # repo's version as a local modification forever.
 
+# }}}
+
+# Configuration and defaults {{{
 DOTFILES_REPO=${DOTFILES_REPO:-git@github.com:grahamlopez/dots}
 INSTALL_ROOT=${INSTALL_ROOT:-"$HOME/local"}
 APPS_DIR=${APPS_DIR:-"$INSTALL_ROOT/apps"}
@@ -76,6 +80,9 @@ LIST_STEPS_ONLY=0
 PENDING_ONLY=
 PENDING_SKIP=
 
+# }}}
+
+# Step registry {{{
 # The step registry. Everything that installs something is described here once;
 # main, usage, the flag parser, the prerequisite check, and the wizard are all
 # driven from it, so adding a step means adding one row rather than touching
@@ -152,6 +159,9 @@ declare -A STEP_ON=()
 for _step in "${STEP_ORDER[@]}"; do STEP_ON[$_step]=1; done
 unset _step
 
+# }}}
+
+# Step selection and run state {{{
 step_exists() {
   [[ -n "${STEP_LABEL[$1]:-}" ]]
 }
@@ -173,6 +183,9 @@ set_step_explicit() {
 # Steps that failed without stopping the run. Reported by print_completion_notes.
 FAILED_STEPS=
 
+# }}}
+
+# Command line: usage, flags, parsing {{{
 usage() {
   cat <<'USAGE'
 Usage: build-agent-env.sh [options]
@@ -320,6 +333,9 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+# }}}
+
+# Logging and process helpers {{{
 log() {
   printf '\n==> %s\n' "$*"
 }
@@ -386,6 +402,9 @@ prompt_yes_no() {
   esac
 }
 
+# }}}
+
+# Platform detection {{{
 require_linux() {
   kernel=$(uname -s)
   [ "$kernel" = Linux ] || die "this installer only supports Linux; detected $kernel"
@@ -421,6 +440,9 @@ is_debian_like() {
   )
 }
 
+# }}}
+
+# Directories, symlinks, shell profile {{{
 ensure_dirs() {
   mkdir -p "$APPS_DIR" "$OPT_DIR" "$BIN_DIR" "$SCRATCH_DIR"
   export GOBIN="$BIN_DIR"
@@ -491,6 +513,9 @@ EOF2
   fi
 }
 
+# }}}
+
+# Prerequisites {{{
 # Prerequisite packages, split by who needs them.
 #
 # Required covers this installer plus the tools it installs: the tmux build
@@ -499,16 +524,42 @@ EOF2
 # modules, and what cgo uses. Optional is the dev-box set -- nothing in the
 # bootstrap or the installed tools calls any of it.
 #
-# Deliberately absent from both: autoconf, automake, bison, cmake, gettext, and
-# ninja. tmux ships a pre-generated configure and cmd-parse.c in its release
-# tarball, and Neovim is installed as a binary release, so nothing here builds
-# from an autotools or CMake source tree.
+# bison is required even though tmux ships a pre-generated cmd-parse.c: its
+# configure runs AC_CHECK_PROG on $YACC and hard-errors with "yacc not found"
+# before it ever gets to the build, so the pre-generated parser does not save
+# us. byacc or any other yacc satisfies the check equally well.
+#
+# Deliberately absent from both: autoconf, automake, cmake, gettext, and ninja.
+# tmux ships a pre-generated configure in its release tarball, and Neovim is
+# installed as a binary release, so nothing here builds from an autotools or
+# CMake source tree.
+#
+# Prints one section, or both. "required" and "optional" are used on their own
+# when only that half of the report is actionable; with no argument both print,
+# separated by a blank line.
 print_prereq_packages() {
-  if is_debian_like; then
-    cat <<'EOF2'
+  want_required=1
+  want_optional=1
+  case ${1:-all} in
+    required) want_optional=0 ;;
+    optional) want_required=0 ;;
+  esac
+
+  # apt-get update belongs to whichever command comes first in the output.
+  apt_optional_prefix='sudo apt-get install -y'
+  if [ "$want_required" = 0 ]; then
+    apt_optional_prefix='sudo apt-get update && sudo apt-get install -y'
+  fi
+
+  is_debian_like || printf 'Package names vary by distribution.\n\n'
+
+  if [ "$want_required" = 1 ]; then
+    if is_debian_like; then
+      cat <<'EOF2'
 Required -- this installer and the tools it installs:
 
 sudo apt-get update && sudo apt-get install -y \
+  bison \
   build-essential \
   ca-certificates \
   curl \
@@ -520,32 +571,43 @@ sudo apt-get update && sudo apt-get install -y \
   pkg-config \
   tar \
   util-linux
-
-Optional -- a working dev environment, not needed to bootstrap:
-
-sudo apt-get install -y \
-  fd-find \
-  python3 \
-  python3-pip \
-  python3-venv \
-  ripgrep \
-  shellcheck \
-  unzip \
-  wget \
-  xclip \
-  xz-utils
 EOF2
-  else
-    cat <<'EOF2'
-Package names vary by distribution.
-
+    else
+      cat <<'EOF2'
 Required -- this installer and the tools it installs:
 
   toolchain   C compiler, make, pkg-config    (tmux build; --skip-tmux drops it)
+  parser      bison or byacc                  (tmux build; --skip-tmux drops it)
   headers     libevent, ncurses               (tmux build; --skip-tmux drops it)
   downloads   curl, tar, ca-certificates
   tools       git, jq, coreutils, util-linux, openssh client
+EOF2
+    fi
+  fi
 
+  if [ "$want_required" = 1 ] && [ "$want_optional" = 1 ]; then
+    printf '\n'
+  fi
+
+  if [ "$want_optional" = 1 ]; then
+    if is_debian_like; then
+      cat <<EOF2
+Optional -- a working dev environment, not needed to bootstrap:
+
+$apt_optional_prefix \\
+  fd-find \\
+  python3 \\
+  python3-pip \\
+  python3-venv \\
+  ripgrep \\
+  shellcheck \\
+  unzip \\
+  wget \\
+  xclip \\
+  xz-utils
+EOF2
+    else
+      cat <<'EOF2'
 Optional -- a working dev environment, not needed to bootstrap:
 
   search      ripgrep, fd
@@ -555,20 +617,8 @@ Optional -- a working dev environment, not needed to bootstrap:
   linting     shellcheck
   downloads   wget (curl is used when it is absent)
 EOF2
+    fi
   fi
-}
-
-# True when a step that clones over GitHub SSH is enabled.
-uses_github_ssh() {
-  if step_on core-dotfiles && repo_uses_github_ssh "$DOTFILES_REPO"; then
-    return 0
-  fi
-
-  if step_on ai-dotfiles && repo_uses_github_ssh "$AI_DOTFILES_REPO"; then
-    return 0
-  fi
-
-  return 1
 }
 
 # Commands this script actually runs, narrowed to the steps that are enabled.
@@ -582,7 +632,7 @@ required_commands() {
   fi
 
   if step_on tmux; then
-    printf '%s\n' cc make pkg-config
+    printf '%s\n' cc make pkg-config yacc
   fi
 
   if step_on pi; then
@@ -611,10 +661,15 @@ optional_commands() {
 }
 
 # Debian packages fd as "fdfind", so either name satisfies the fd prerequisite.
+# tmux's configure accepts any yacc, and not every distribution installs the
+# generic "yacc" name alongside bison, so accept the implementations directly.
 have_prereq() {
   case "$1" in
     fd)
       have fd || have fdfind
+      ;;
+    yacc)
+      have yacc || have bison || have byacc
       ;;
     *)
       have "$1"
@@ -705,9 +760,25 @@ EOF2
     die "prerequisites are not satisfied (or rerun with --skip-prereqs to bypass this check)"
   fi
 
+  # Nothing here blocks the run, but the install command is only useful if it is
+  # printed, so show it whenever something optional is absent.
+  if [ -n "$optional_missing" ]; then
+    cat <<EOF2
+
+The optional commands are not needed to bootstrap, so the installer continues
+without them. To fill them in on $(distro_name):
+
+EOF2
+    print_prereq_packages optional
+    printf '\n'
+  fi
+
   link_fd_alias
 }
 
+# }}}
+
+# GitHub access {{{
 ensure_github_known_host() {
   mkdir -p "$HOME/.ssh"
   chmod 700 "$HOME/.ssh"
@@ -729,6 +800,19 @@ repo_uses_github_ssh() {
       return 1
       ;;
   esac
+}
+
+# True when a step that clones over GitHub SSH is enabled.
+uses_github_ssh() {
+  if step_on core-dotfiles && repo_uses_github_ssh "$DOTFILES_REPO"; then
+    return 0
+  fi
+
+  if step_on ai-dotfiles && repo_uses_github_ssh "$AI_DOTFILES_REPO"; then
+    return 0
+  fi
+
+  return 1
 }
 
 require_github_repo_access() {
@@ -755,6 +839,9 @@ EOF2
   fi
 }
 
+# }}}
+
+# Dotfiles {{{
 git_default_branch() {
   repo_dir=$1
   branch=$(git --git-dir="$repo_dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##') || branch=
@@ -828,6 +915,9 @@ install_ai_dotfiles() {
   install_bare_dotfiles ai "$AI_DOTFILES_REPO" "$AI_DOTFILES_DIR"
 }
 
+# }}}
+
+# Download and build helpers {{{
 latest_github_tag() {
   repo=$1
   latest_url=https://github.com/$repo/releases/latest
@@ -859,6 +949,26 @@ cpu_count() {
   fi
 }
 
+machine_arch() {
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64|amd64)
+      printf 'x86_64\n'
+      ;;
+    aarch64|arm64)
+      printf 'arm64\n'
+      ;;
+    *)
+      die "unsupported architecture for Neovim release asset: $arch"
+      ;;
+  esac
+}
+
+# }}}
+
+# Install steps {{{
+
+# tmux {{{
 install_tmux() {
   log "Building latest tmux release"
   tag=$(latest_github_tag tmux/tmux)
@@ -886,21 +996,9 @@ install_tmux() {
   symlink_file "$BIN_DIR/tmux" "$prefix/bin/tmux"
 }
 
-machine_arch() {
-  arch=$(uname -m)
-  case "$arch" in
-    x86_64|amd64)
-      printf 'x86_64\n'
-      ;;
-    aarch64|arm64)
-      printf 'arm64\n'
-      ;;
-    *)
-      die "unsupported architecture for Neovim release asset: $arch"
-      ;;
-  esac
-}
+# }}}
 
+# Neovim {{{
 install_nvim() {
   log "Installing latest Neovim release"
   tag=$(latest_github_tag neovim/neovim)
@@ -923,6 +1021,9 @@ install_nvim() {
   symlink_file "$BIN_DIR/nvim" "$prefix/bin/nvim"
 }
 
+# }}}
+
+# Go {{{
 go_release_arch() {
   arch=$(uname -m)
   case "$arch" in
@@ -1012,6 +1113,9 @@ install_go() {
   log "Go $version installed with GOROOT=$goroot and GOBIN=$GOBIN"
 }
 
+# }}}
+
+# Node and npm {{{
 install_nvm_node() {
   log "Installing nvm, Node.js, and npm"
   export NVM_DIR="$HOME/.nvm"
@@ -1059,6 +1163,9 @@ install_global_npm_tools() {
     yarn
 }
 
+# }}}
+
+# Agent CLIs {{{
 install_claude() {
   log "Installing the Claude CLI"
   use_default_node
@@ -1123,6 +1230,11 @@ install_brev() {
     "$HOME/.local/bin/brev"
 }
 
+# }}}
+
+# }}}
+
+# Completion notes {{{
 print_completion_notes() {
   if [ -n "$FAILED_STEPS" ]; then
     cat <<EOF2
@@ -1153,8 +1265,9 @@ If this was the first nvm install in the shell, open a new terminal or run:
 EOF2
 }
 
-# --- installed-state detection --------------------------------------------
+# }}}
 
+# Installed-state detection {{{
 # node and the global npm tools live under nvm, which is not on PATH until it is
 # sourced, so look for the binary directly rather than using command -v.
 nvm_bin() {
@@ -1241,8 +1354,9 @@ detect_step_status() {
   done
 }
 
-# --- wizard ----------------------------------------------------------------
+# }}}
 
+# Wizard {{{
 # Test by opening /dev/tty, not with -r/-w: the permission test can pass on a
 # /dev/tty that cannot actually be opened.
 tty_available() {
@@ -1425,6 +1539,9 @@ run_wizard() {
   done
 }
 
+# }}}
+
+# Dependency resolution and main {{{
 # Turn on anything a selected step depends on. Loops until stable so a chain of
 # dependencies resolves.
 resolve_step_deps() {
@@ -1495,3 +1612,7 @@ main() {
 }
 
 main "$@"
+
+# }}}
+
+# vim: set foldmethod=marker foldlevel=0:

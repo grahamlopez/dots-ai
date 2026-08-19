@@ -522,7 +522,8 @@ EOF2
 # needs a toolchain and the libevent/ncurses headers, and that same toolchain is
 # what nvim-treesitter uses to compile parsers, what node-gyp uses for native npm
 # modules, and what cgo uses. Optional is the dev-box set -- nothing in the
-# bootstrap or the installed tools calls any of it.
+# bootstrap calls any of it, though the dotfiles' Claude statusline uses bc for
+# float math once it is in place.
 #
 # bison is required even though tmux ships a pre-generated cmd-parse.c: its
 # configure runs AC_CHECK_PROG on $YACC and hard-errors with "yacc not found"
@@ -595,6 +596,7 @@ EOF2
 Optional -- a working dev environment, not needed to bootstrap:
 
 $apt_optional_prefix \\
+  bc \\
   fd-find \\
   python3 \\
   python3-pip \\
@@ -615,6 +617,7 @@ Optional -- a working dev environment, not needed to bootstrap:
   python      python3 with pip and venv
   archives    unzip, xz
   linting     shellcheck
+  statusline  bc (Claude Code statusline)
   downloads   wget (curl is used when it is absent)
 EOF2
     fi
@@ -657,7 +660,7 @@ required_commands() {
 # Wanted in the finished environment but never invoked here, so a missing one is
 # reported and then ignored rather than treated as a failure.
 optional_commands() {
-  printf '%s\n' rg fd xclip shellcheck python3 unzip xz wget
+  printf '%s\n' rg fd xclip shellcheck python3 unzip xz wget bc
 }
 
 # Debian packages fd as "fdfind", so either name satisfies the fd prerequisite.
